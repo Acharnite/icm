@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.10.46](https://github.com/rtk-ai/icm/compare/icm-v0.10.45...icm-v0.10.46) (2026-05-10)
+
+
+### Bug Fixes
+
+* **hook:** read Claude Code 2.x tool_response.output payload (CRITICAL) ([#212](https://github.com/rtk-ai/icm/issues/212)) ([9bc2009](https://github.com/rtk-ai/icm/commit/9bc20090fec5c7aa5e5eb5d316d56008b4e713b1))
+* **init:** turn 7 init unwrap panics into proper error returns ([#213](https://github.com/rtk-ai/icm/issues/213)) ([647f1b3](https://github.com/rtk-ai/icm/commit/647f1b32bc8e2a9b3dae569e7113b996371509dd))
+
 ## [0.10.45](https://github.com/rtk-ai/icm/compare/icm-v0.10.44...icm-v0.10.45) (2026-05-10)
 
 
