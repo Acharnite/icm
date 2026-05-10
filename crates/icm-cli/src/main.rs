@@ -24,9 +24,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::Value;
 
 use icm_core::{
-    build_wake_up, is_preference_topic, keyword_matches, project_matches, topic_matches, Concept,
-    ConceptLink, Feedback, FeedbackStore, Importance, Label, Memoir, MemoirStore, Memory,
-    MemoryStore, Relation, WakeUpFormat, WakeUpOptions, MSG_NO_MEMORIES,
+    build_wake_up, format_local, is_preference_topic, keyword_matches, project_matches,
+    topic_matches, Concept, ConceptLink, Feedback, FeedbackStore, Importance, Label, Memoir,
+    MemoirStore, Memory, MemoryStore, Relation, WakeUpFormat, WakeUpOptions, MSG_NO_MEMORIES,
 };
 use icm_store::SqliteStore;
 
@@ -1778,6 +1778,13 @@ fn cmd_health(store: &SqliteStore, topic_filter: Option<&str>) -> Result<()> {
         needs_consolidation,
         total_stale
     );
+    if needs_consolidation > 0 {
+        // Issue #186: be explicit that the default consolidate is a
+        // lexical join, not summarization, so users (and agents acting
+        // on this output) don't silently degrade memory quality.
+        println!();
+        println!("{}", health_consolidate_tip());
+    }
     Ok(())
 }
 
@@ -1943,7 +1950,10 @@ fn cmd_transcript_search(
             "  session:  {} ({}, project={}, agent={})",
             hit.session.id, hit.message.role, proj, hit.session.agent
         );
-        println!("  ts:       {}", hit.message.ts.format("%Y-%m-%d %H:%M:%S"));
+        println!(
+            "  ts:       {}",
+            format_local(&hit.message.ts, "%Y-%m-%d %H:%M:%S")
+        );
         println!("  score:    {:.3}", hit.score);
         if let Some(t) = &hit.message.tool_name {
             println!("  tool:     {t}");
@@ -1978,8 +1988,8 @@ fn cmd_transcript_list_sessions(
             short_id,
             truncate(&s.agent, 14),
             truncate(proj, 18),
-            s.started_at.format("%Y-%m-%d %H:%M:%S"),
-            s.updated_at.format("%Y-%m-%d %H:%M:%S"),
+            format_local(&s.started_at, "%Y-%m-%d %H:%M:%S"),
+            format_local(&s.updated_at, "%Y-%m-%d %H:%M:%S"),
         );
     }
     Ok(())
@@ -2000,14 +2010,14 @@ fn cmd_transcript_show(store: &SqliteStore, session: &str, limit: usize) -> Resu
         "agent={} project={} started={} updated={}",
         meta.agent,
         meta.project.as_deref().unwrap_or("-"),
-        meta.started_at.format("%Y-%m-%d %H:%M:%S"),
-        meta.updated_at.format("%Y-%m-%d %H:%M:%S"),
+        format_local(&meta.started_at, "%Y-%m-%d %H:%M:%S"),
+        format_local(&meta.updated_at, "%Y-%m-%d %H:%M:%S"),
     );
     println!();
 
     let messages = store.list_session_messages(session, limit, 0)?;
     for m in messages {
-        let ts = m.ts.format("%H:%M:%S");
+        let ts = format_local(&m.ts, "%H:%M:%S");
         let tool = m
             .tool_name
             .as_ref()
@@ -2036,8 +2046,8 @@ fn cmd_transcript_stats(store: &SqliteStore) -> Result<()> {
     if let (Some(o), Some(n)) = (&s.oldest, &s.newest) {
         println!(
             "Range:         {} -> {}",
-            o.format("%Y-%m-%d %H:%M"),
-            n.format("%Y-%m-%d %H:%M")
+            format_local(o, "%Y-%m-%d %H:%M"),
+            format_local(n, "%Y-%m-%d %H:%M")
         );
     }
     if !s.by_role.is_empty() {
@@ -2606,10 +2616,70 @@ fn cmd_hook_prompt(store: &SqliteStore) -> Result<()> {
     };
     let ctx = extract::recall_context(store, query, project_filter, 5)?;
     if !ctx.is_empty() {
-        print!("{ctx}");
+        emit_hook_context(&ctx);
     }
 
     Ok(())
+}
+
+/// Output target for hook stdout. Different agent runtimes have
+/// incompatible contracts for what they expect on stdout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HookOutputFormat {
+    /// Plain text. Claude Code, Gemini CLI, and Codex CLI all treat
+    /// any non-JSON stdout from a hook as injected context — so a
+    /// markdown wake-up pack or recall block is the right shape.
+    Plain,
+    /// JSON `{"additional_context": "..."}`. Cursor's hook runtime
+    /// requires JSON output matching its per-event schema; plain
+    /// text triggers `JSON Parse Error: Unexpected token …`.
+    /// Issue #120.
+    CursorJson,
+}
+
+/// Detect which output format this hook invocation should emit.
+///
+/// Cursor injects `CURSOR_PROJECT_DIR` (and historically also
+/// `CURSOR_VERSION`) into the hook environment, so the presence of
+/// either flips the format. `ICM_HOOK_OUTPUT_FORMAT` lets a user (or
+/// the wrapper script in `~/.cursor/hooks/`) override the auto-detect:
+///
+///   ICM_HOOK_OUTPUT_FORMAT=plain    # force passthrough (Claude shape)
+///   ICM_HOOK_OUTPUT_FORMAT=cursor   # force JSON wrap
+fn detect_hook_output_format() -> HookOutputFormat {
+    if let Ok(v) = std::env::var("ICM_HOOK_OUTPUT_FORMAT") {
+        match v.trim().to_ascii_lowercase().as_str() {
+            "cursor" | "json" => return HookOutputFormat::CursorJson,
+            "plain" | "claude" => return HookOutputFormat::Plain,
+            _ => {}
+        }
+    }
+    if std::env::var("CURSOR_PROJECT_DIR").is_ok() || std::env::var("CURSOR_VERSION").is_ok() {
+        return HookOutputFormat::CursorJson;
+    }
+    HookOutputFormat::Plain
+}
+
+/// Wrap recalled / wake-up context for the active hook runtime and
+/// write it to stdout. Issue #120: previously the hook commands wrote
+/// raw markdown via `print!`, which Cursor's hook runtime rejected
+/// with a JSON parse error on every fire.
+fn emit_hook_context(ctx: &str) {
+    print!("{}", format_hook_context(ctx, detect_hook_output_format()));
+}
+
+/// Pure helper for `emit_hook_context`. Public-in-crate so tests can
+/// pin the wrapping behavior without mutating process env vars.
+fn format_hook_context(ctx: &str, fmt: HookOutputFormat) -> String {
+    match fmt {
+        HookOutputFormat::Plain => ctx.to_string(),
+        HookOutputFormat::CursorJson => {
+            // serde_json escapes the string and emits a one-line JSON
+            // object — exactly the shape Cursor's hook runtime parses
+            // for `additional_context`.
+            serde_json::json!({ "additional_context": ctx }).to_string()
+        }
+    }
 }
 
 /// SessionStart hook (Layer 0): inject a wake-up pack of critical memories at
@@ -2639,7 +2709,7 @@ fn cmd_hook_start(store: &SqliteStore, max_tokens: usize) -> Result<()> {
         }
         return Ok(());
     }
-    print!("{pack}");
+    emit_hook_context(&pack);
     Ok(())
 }
 
@@ -2720,10 +2790,10 @@ fn cmd_stats(store: &SqliteStore) -> Result<()> {
     println!("Topics:    {}", stats.total_topics);
     println!("Avg weight: {:.3}", stats.avg_weight);
     if let Some(oldest) = stats.oldest_memory {
-        println!("Oldest:    {}", oldest.format("%Y-%m-%d %H:%M"));
+        println!("Oldest:    {}", format_local(&oldest, "%Y-%m-%d %H:%M"));
     }
     if let Some(newest) = stats.newest_memory {
-        println!("Newest:    {}", newest.format("%Y-%m-%d %H:%M"));
+        println!("Newest:    {}", format_local(&newest, "%Y-%m-%d %H:%M"));
     }
     Ok(())
 }
@@ -2828,9 +2898,41 @@ fn cmd_extract_patterns(
     Ok(())
 }
 
+/// Stringify the icm binary path for embedding in a hook config command
+/// string. Issue #180: on Windows `current_exe()` returns
+/// `C:\Users\…\icm.exe`, and bash on Windows (Git Bash, the shell every
+/// AI agent CLI invokes) interprets the backslashes as escape sequences
+/// — `\U`, `\A`, `\b` etc. get stripped, yielding nonsense like
+/// `C:UsersusernameAppDataLocal…`. Windows accepts forward slashes in
+/// file paths, so normalize once at the boundary where the path enters a
+/// command string.
+fn portable_command_path(path: &Path) -> String {
+    path.to_string_lossy().to_string().replace('\\', "/")
+}
+
+/// Substring-match a hook command against a canonical Unix-style pattern,
+/// also accepting the equivalent Windows form. Issue #180: with the
+/// canonical `icm hook pre` pattern, a Windows command
+/// `C:/.../icm.exe hook pre` was missed by every detect site (init
+/// idempotency, doctor binary check, codex/copilot injectors), so init
+/// re-injected duplicates and doctor reported zero hooks.
+fn cmd_matches_icm_pattern(cmd: &str, pattern: &str) -> bool {
+    if cmd.contains(pattern) {
+        return true;
+    }
+    // (a) `icm hook ...` written as `icm.exe hook ...`
+    let with_exe = pattern.replacen("icm hook", "icm.exe hook", 1);
+    if with_exe != pattern && cmd.contains(&with_exe) {
+        return true;
+    }
+    // (b) legacy bare-basename patterns (`icm-post-tool`, `icm-pretool`)
+    //     that point at a standalone `.exe` on Windows.
+    cmd.contains(&format!("{pattern}.exe"))
+}
+
 fn cmd_init(mode: InitMode, force: bool) -> Result<()> {
     let icm_bin = std::env::current_exe().context("cannot determine icm binary path")?;
-    let icm_bin_str = icm_bin.to_string_lossy().to_string();
+    let icm_bin_str = portable_command_path(&icm_bin);
     let home = home_dir_str()?;
 
     // Per-CLI config directories, with env var overrides honored.
@@ -3369,83 +3471,190 @@ fn inject_icm_block(path: &Path, block: &str) -> Result<String> {
     }
 }
 
+/// Where in the hook entry the binary path lives. Differs across CLIs.
+#[derive(Clone, Copy)]
+enum HookCommandField {
+    /// `{"hooks":[{"type":"command","command":"..."}]}` — Claude Code, Gemini, Codex.
+    Command,
+    /// `{"type":"command","bash":"...","timeoutSec":N}` — Copilot CLI.
+    BashTopLevel,
+}
+
+/// One host platform's hook configuration layout.
+struct DoctorTarget {
+    label: &'static str,
+    path: PathBuf,
+    events: &'static [&'static str],
+    field: HookCommandField,
+}
+
+/// Inspect a single hook command string. Returns `Some((bin_path, exists))`
+/// if the command references ICM, `None` if it should be skipped.
+fn check_icm_hook_command(cmd: &str) -> Option<(&str, bool)> {
+    if !cmd_matches_icm_pattern(cmd, "icm hook") && !cmd_matches_icm_pattern(cmd, "icm-post-tool") {
+        return None;
+    }
+    let bin_path = cmd.split_whitespace().next().unwrap_or("");
+    let exists = std::path::Path::new(bin_path).exists();
+    Some((bin_path, exists))
+}
+
+/// Walk a settings/hooks JSON file for one platform, printing one line per
+/// ICM hook entry. Returns `(checked, broken)`.
+fn check_json_target(target: &DoctorTarget) -> (usize, usize) {
+    if !target.path.exists() {
+        println!(
+            "[{}] {} (no settings file, skipped)",
+            target.label,
+            target.path.display()
+        );
+        return (0, 0);
+    }
+    let config: Value = match parse_json_config(&target.path) {
+        Ok(v) => v,
+        Err(e) => {
+            println!(
+                "[{}] {}: parse error ({e})",
+                target.label,
+                target.path.display()
+            );
+            return (0, 1);
+        }
+    };
+    let Some(hooks) = config.get("hooks").and_then(|h| h.as_object()) else {
+        println!("[{}] no hooks block configured", target.label);
+        return (0, 0);
+    };
+
+    let mut checked = 0;
+    let mut broken = 0;
+    for event in target.events {
+        let Some(arr) = hooks.get(*event).and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for entry in arr {
+            // Two shapes:
+            //   Command       -> entry.hooks[].command
+            //   BashTopLevel  -> entry.bash (entry IS the hook)
+            let commands: Vec<&str> = match target.field {
+                HookCommandField::Command => entry
+                    .get("hooks")
+                    .and_then(|h| h.as_array())
+                    .map(|hs| {
+                        hs.iter()
+                            .filter_map(|h| h.get("command").and_then(|c| c.as_str()))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                HookCommandField::BashTopLevel => entry
+                    .get("bash")
+                    .and_then(|c| c.as_str())
+                    .into_iter()
+                    .collect(),
+            };
+
+            for cmd in commands {
+                let Some((bin_path, exists)) = check_icm_hook_command(cmd) else {
+                    continue;
+                };
+                checked += 1;
+                if exists {
+                    println!("[{}] {event:<19} ✓  {bin_path}", target.label);
+                } else {
+                    println!("[{}] {event:<19} ✗  {bin_path}  (missing)", target.label);
+                    broken += 1;
+                }
+            }
+        }
+    }
+    (checked, broken)
+}
+
+/// OpenCode installs a TypeScript plugin instead of a JSON hook entry, so
+/// it has no command path to validate — only file existence.
+fn check_opencode_plugin(home: &str) -> usize {
+    let plugin = PathBuf::from(home).join(".config/opencode/plugins/icm.ts");
+    if plugin.exists() {
+        println!("[OpenCode] {:<19} ✓  {}", "plugin", plugin.display());
+        1
+    } else {
+        // Not "broken" — could legitimately be uninstalled. Just inform.
+        println!(
+            "[OpenCode] {} (no plugin installed, skipped)",
+            plugin.display()
+        );
+        0
+    }
+}
+
 fn cmd_doctor() -> Result<()> {
     let home = home_dir_str()?;
     let current_bin = std::env::current_exe().ok();
 
-    let targets: Vec<(&str, PathBuf, &[&str])> = vec![
-        (
-            "Claude Code",
-            PathBuf::from(&home).join(".claude/settings.json"),
-            &[
+    // Claude Code, Gemini CLI, and Codex CLI all use the
+    // `{hooks:{Event:[{hooks:[{command:...}]}]}}` shape but at different
+    // paths and event names. Copilot CLI uses the same outer shape but
+    // its hook entries put the command in a top-level `bash` field
+    // instead of nesting under `hooks[]`.
+    let targets: Vec<DoctorTarget> = vec![
+        DoctorTarget {
+            label: "Claude Code",
+            path: PathBuf::from(&home).join(".claude/settings.json"),
+            events: &[
                 "PreToolUse",
                 "PostToolUse",
                 "PreCompact",
                 "UserPromptSubmit",
                 "SessionStart",
+                "SessionEnd",
             ],
-        ),
-        (
-            "Gemini CLI",
-            PathBuf::from(&home).join(".gemini/settings.json"),
-            &[
+            field: HookCommandField::Command,
+        },
+        DoctorTarget {
+            label: "Gemini CLI",
+            path: PathBuf::from(&home).join(".gemini/settings.json"),
+            events: &[
                 "SessionStart",
                 "BeforeTool",
                 "AfterTool",
                 "PreCompress",
                 "BeforeAgent",
             ],
-        ),
+            field: HookCommandField::Command,
+        },
+        DoctorTarget {
+            label: "Codex CLI",
+            path: PathBuf::from(&home).join(".codex/hooks.json"),
+            events: &[
+                "SessionStart",
+                "PreToolUse",
+                "PostToolUse",
+                "UserPromptSubmit",
+            ],
+            field: HookCommandField::Command,
+        },
+        DoctorTarget {
+            label: "Copilot CLI",
+            path: PathBuf::from(&home).join(".copilot/settings.json"),
+            events: &[
+                "sessionStart",
+                "preToolUse",
+                "postToolUse",
+                "userPromptSubmitted",
+            ],
+            field: HookCommandField::BashTopLevel,
+        },
     ];
 
     let mut broken = 0usize;
     let mut checked = 0usize;
 
-    for (label, path, events) in &targets {
-        if !path.exists() {
-            println!("[{label}] {} (no settings file, skipped)", path.display());
-            continue;
-        }
-        let config: Value = match parse_json_config(path) {
-            Ok(v) => v,
-            Err(e) => {
-                println!("[{label}] {}: parse error ({e})", path.display());
-                broken += 1;
-                continue;
-            }
-        };
-        let Some(hooks) = config.get("hooks").and_then(|h| h.as_object()) else {
-            println!("[{label}] no hooks block configured");
-            continue;
-        };
-        for event in *events {
-            let Some(arr) = hooks.get(*event).and_then(|v| v.as_array()) else {
-                continue;
-            };
-            for entry in arr {
-                let Some(hooks_arr) = entry.get("hooks").and_then(|h| h.as_array()) else {
-                    continue;
-                };
-                for h in hooks_arr {
-                    let Some(cmd) = h.get("command").and_then(|c| c.as_str()) else {
-                        continue;
-                    };
-                    if !cmd.contains("icm hook") && !cmd.contains("icm-post-tool") {
-                        continue;
-                    }
-                    checked += 1;
-                    let bin_path = cmd.split_whitespace().next().unwrap_or("");
-                    let exists = std::path::Path::new(bin_path).exists();
-                    if exists {
-                        println!("[{label}] {event:<17} ✓  {bin_path}");
-                    } else {
-                        println!("[{label}] {event:<17} ✗  {bin_path}  (missing)");
-                        broken += 1;
-                    }
-                }
-            }
-        }
+    for target in &targets {
+        let (c, b) = check_json_target(target);
+        checked += c;
+        broken += b;
     }
+    checked += check_opencode_plugin(&home);
 
     println!();
     if checked == 0 {
@@ -3515,7 +3724,10 @@ fn inject_settings_hook(
             let Some(current) = h.get("command").and_then(|c| c.as_str()) else {
                 continue;
             };
-            if !detect_patterns.iter().any(|p| current.contains(p)) {
+            if !detect_patterns
+                .iter()
+                .any(|p| cmd_matches_icm_pattern(current, p))
+            {
                 continue;
             }
             if current == hook_command {
@@ -3611,7 +3823,11 @@ fn inject_codex_hook(
                 hooks.iter().any(|h| {
                     h.get("command")
                         .and_then(|c| c.as_str())
-                        .map(|c| detect_patterns.iter().any(|p| c.contains(p)))
+                        .map(|c| {
+                            detect_patterns
+                                .iter()
+                                .any(|p| cmd_matches_icm_pattern(c, p))
+                        })
                         .unwrap_or(false)
                 })
             })
@@ -4061,7 +4277,7 @@ fn inject_copilot_hooks(copilot_dir: &std::path::Path, icm_bin: &str) -> Result<
                 a.iter().any(|h| {
                     h.get("bash")
                         .and_then(|b| b.as_str())
-                        .map(|s| s.contains("icm hook"))
+                        .map(|s| cmd_matches_icm_pattern(s, "icm hook"))
                         .unwrap_or(false)
                 })
             })
@@ -4258,6 +4474,35 @@ fn lexical_consolidate(memories: &[Memory]) -> String {
     summaries.join(" | ")
 }
 
+/// Build the warning printed when `icm consolidate` runs in lexical-join
+/// mode (provider=none). Issue #186: `icm health` flags topics for
+/// consolidation but the default consolidate degrades quality, so we make
+/// the trade-off explicit on every invocation. The `keep_originals` flag
+/// changes the wording because dropping originals on a lexical join is
+/// strictly worse than keeping them.
+fn lexical_consolidate_warning(keep_originals: bool) -> String {
+    let originals_clause = if keep_originals {
+        ""
+    } else {
+        " Originals will be deleted; pass --keep-originals to retain them."
+    };
+    format!(
+        "warning: consolidating with provider=none — summaries will be \
+         joined with ' | ' (no LLM summarization). Pass \
+         --summarizer-provider <claude|codex|gemini|ollama> for real \
+         consolidation.{originals_clause}"
+    )
+}
+
+/// Hint appended to `icm health` output when one or more topics are flagged
+/// for consolidation. Issue #186: makes it visible that the default
+/// `icm consolidate` is a lexical join, so agents/users don't silently
+/// degrade memory by following the recommendation blindly.
+fn health_consolidate_tip() -> String {
+    "Tip: run `icm consolidate -t <topic> --summarizer-provider <claude|codex|gemini|ollama> --keep-originals`\n\
+     The default (provider=none) joins summaries with ' | ' instead of summarizing.".to_string()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmd_consolidate(
     store: &SqliteStore,
@@ -4284,6 +4529,10 @@ fn cmd_consolidate(
     });
 
     let merged_summary = if matches!(provider_kind, summarizer::ProviderKind::None) {
+        // Issue #186: lexical concatenation isn't a real consolidation —
+        // it grows past input size, dilutes the embedding, and (without
+        // --keep-originals) destroys the originals it replaces.
+        eprintln!("{}", lexical_consolidate_warning(keep_originals));
         lexical_consolidate(&memories)
     } else {
         let provider = summarizer::make_summarizer(provider_kind)?;
@@ -4607,10 +4856,13 @@ fn print_memory_detail(mem: &Memory, score: Option<f32>) {
     println!("  topic:      {}", mem.topic);
     println!("  importance: {}", mem.importance);
     println!("  weight:     {:.3}", mem.weight);
-    println!("  created:    {}", mem.created_at.format("%Y-%m-%d %H:%M"));
+    println!(
+        "  created:    {}",
+        format_local(&mem.created_at, "%Y-%m-%d %H:%M")
+    );
     println!(
         "  accessed:   {} (x{})",
-        mem.last_accessed.format("%Y-%m-%d %H:%M"),
+        format_local(&mem.last_accessed, "%Y-%m-%d %H:%M"),
         mem.access_count
     );
     println!("  summary:    {}", mem.summary);
@@ -5723,11 +5975,11 @@ fn cmd_memoir_show(store: &SqliteStore, name: &str) -> Result<()> {
     }
     println!(
         "  created:     {}",
-        memoir.created_at.format("%Y-%m-%d %H:%M")
+        format_local(&memoir.created_at, "%Y-%m-%d %H:%M")
     );
     println!(
         "  updated:     {}",
-        memoir.updated_at.format("%Y-%m-%d %H:%M")
+        format_local(&memoir.updated_at, "%Y-%m-%d %H:%M")
     );
     println!("  concepts:    {}", stats.total_concepts);
     println!("  links:       {}", stats.total_links);
@@ -6175,8 +6427,14 @@ fn print_concept(c: &Concept) {
         let labels_str = c.format_labels();
         println!("  labels:     {labels_str}");
     }
-    println!("  created:    {}", c.created_at.format("%Y-%m-%d %H:%M"));
-    println!("  updated:    {}", c.updated_at.format("%Y-%m-%d %H:%M"));
+    println!(
+        "  created:    {}",
+        format_local(&c.created_at, "%Y-%m-%d %H:%M")
+    );
+    println!(
+        "  updated:    {}",
+        format_local(&c.updated_at, "%Y-%m-%d %H:%M")
+    );
     if !c.source_memory_ids.is_empty() {
         println!("  sources:    {}", c.source_memory_ids.join(", "));
     }
@@ -7078,5 +7336,432 @@ mod cli_contracts_tests {
         for &good in &[0.0_f32, 0.5, 0.95, 0.999_999] {
             cmd_decay(&store, good).unwrap_or_else(|e| panic!("factor={good} rejected: {e}"));
         }
+    }
+
+    /// Issue #186: lexical-mode consolidate must announce that it is NOT
+    /// summarizing and must point users at the LLM-backed flag. Without
+    /// this, agents acting on `icm health` recommendations silently
+    /// degrade memory quality.
+    #[test]
+    fn lexical_consolidate_warning_names_the_real_flag() {
+        let warning = lexical_consolidate_warning(false);
+        assert!(
+            warning.contains("provider=none"),
+            "must name the actual mode it is in: {warning}"
+        );
+        assert!(
+            warning.contains("--summarizer-provider"),
+            "must point at the flag that fixes it: {warning}"
+        );
+        assert!(
+            warning.to_lowercase().contains("warning"),
+            "must be visibly a warning, not info: {warning}"
+        );
+    }
+
+    /// Issue #186: when --keep-originals is omitted, the warning must say
+    /// so explicitly — that's the destructive case.
+    #[test]
+    fn lexical_consolidate_warning_flags_destructive_default() {
+        let destructive = lexical_consolidate_warning(false);
+        let safe = lexical_consolidate_warning(true);
+        assert!(
+            destructive.contains("Originals will be deleted"),
+            "warning must call out destructive behavior when keep_originals=false: {destructive}"
+        );
+        assert!(
+            !safe.contains("Originals will be deleted"),
+            "no destructive-deletion clause when keep_originals=true: {safe}"
+        );
+    }
+
+    /// Issue #186: `icm health` must expose `--summarizer-provider` to
+    /// users it nudges toward consolidation, otherwise it's the source of
+    /// the silent-degradation flow.
+    #[test]
+    fn health_consolidate_tip_names_real_summarizer_flag() {
+        let tip = health_consolidate_tip();
+        assert!(tip.contains("--summarizer-provider"));
+        assert!(tip.contains("provider=none"));
+        assert!(tip.contains("--keep-originals"));
+    }
+}
+
+#[cfg(test)]
+mod doctor_tests {
+    //! Issue #174: `icm doctor` must walk every platform `icm init`
+    //! configures (Claude Code, Gemini, Codex, Copilot, OpenCode), not
+    //! just Gemini. These tests use temp settings.json fixtures to lock
+    //! in: each layout shape, the "missing binary" path, and the
+    //! count of entries reported.
+    use super::*;
+    use tempfile::TempDir;
+
+    fn write_settings(dir: &TempDir, rel: &str, content: &str) -> PathBuf {
+        let path = dir.path().join(rel);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    /// Drop a fake `icm` binary at `<dir>/bin/icm` so doctor's
+    /// "binary exists" check has something real to point at, AND so the
+    /// stringified path contains the literal substring `icm` followed by
+    /// ` hook` once we append the subcommand. Real installs always end
+    /// in `.../icm`; the cargo test runner's binary is `icm-<hash>`,
+    /// which fails the `contains("icm hook")` substring filter.
+    fn fake_icm_binary(dir: &TempDir) -> PathBuf {
+        let bin_dir = dir.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let bin = bin_dir.join("icm");
+        std::fs::write(&bin, b"#!/bin/sh\nexit 0\n").unwrap();
+        bin
+    }
+
+    /// Stringify a binary path for embedding in a JSON fixture. On Windows,
+    /// `path.display()` emits `C:\Users\…\bin\icm`, where `\U` is an
+    /// invalid JSON escape — serde_json then rejects the whole document
+    /// before we can even walk the hooks. Windows accepts forward slashes
+    /// in file paths, so normalize before interpolating.
+    fn json_safe_path(path: &Path) -> String {
+        path.display().to_string().replace('\\', "/")
+    }
+
+    fn make_target(
+        label: &'static str,
+        path: PathBuf,
+        events: &'static [&'static str],
+        field: HookCommandField,
+    ) -> DoctorTarget {
+        DoctorTarget {
+            label,
+            path,
+            events,
+            field,
+        }
+    }
+
+    #[test]
+    fn check_icm_hook_command_filters_non_icm_commands() {
+        // Other tools' hooks (rtk, prettier, custom scripts) must not be
+        // counted, only icm-owned ones.
+        assert!(check_icm_hook_command("/usr/bin/rtk hook claude").is_none());
+        assert!(check_icm_hook_command("npx prettier --write").is_none());
+        let (bin, exists) = check_icm_hook_command("/usr/local/bin/icm hook pre").unwrap();
+        assert_eq!(bin, "/usr/local/bin/icm");
+        // Path doesn't actually exist on the test runner — `exists` is `false`.
+        assert!(!exists);
+    }
+
+    #[test]
+    fn check_icm_hook_command_marks_existing_binary_as_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_icm_binary(&dir);
+        let cmd = format!("{} hook pre", bin.display());
+        let (_, exists) = check_icm_hook_command(&cmd).unwrap();
+        assert!(exists, "binary at {bin:?} should be detected as present");
+    }
+
+    /// Claude Code shape: command nested under `entry.hooks[].command`.
+    /// Issue #174: SessionEnd must be in the events list.
+    #[test]
+    fn claude_code_shape_finds_all_six_events_including_session_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_icm_binary(&dir);
+        let bin_str = json_safe_path(&bin);
+        let json = format!(
+            r#"{{
+              "hooks": {{
+                "PreToolUse":       [{{"matcher":"Bash","hooks":[{{"type":"command","command":"{bin_str} hook pre"}}]}}],
+                "PostToolUse":      [{{"hooks":[{{"type":"command","command":"{bin_str} hook post"}}]}}],
+                "PreCompact":       [{{"hooks":[{{"type":"command","command":"{bin_str} hook compact"}}]}}],
+                "UserPromptSubmit": [{{"hooks":[{{"type":"command","command":"{bin_str} hook prompt"}}]}}],
+                "SessionStart":     [{{"hooks":[{{"type":"command","command":"{bin_str} hook start"}}]}}],
+                "SessionEnd":       [{{"hooks":[{{"type":"command","command":"{bin_str} hook end"}}]}}]
+              }}
+            }}"#
+        );
+        let path = write_settings(&dir, ".claude/settings.json", &json);
+        let target = make_target(
+            "Claude Code",
+            path,
+            &[
+                "PreToolUse",
+                "PostToolUse",
+                "PreCompact",
+                "UserPromptSubmit",
+                "SessionStart",
+                "SessionEnd",
+            ],
+            HookCommandField::Command,
+        );
+        let (checked, broken) = check_json_target(&target);
+        assert_eq!(checked, 6, "must count all 6 Claude Code hooks");
+        assert_eq!(
+            broken, 0,
+            "all binaries exist, none should be flagged broken"
+        );
+    }
+
+    /// Copilot CLI uses a top-level `bash` field on each entry, not a
+    /// nested `hooks[].command`. Without explicit support this entire
+    /// platform was silently ignored by `icm doctor` (issue #174).
+    #[test]
+    fn copilot_cli_shape_uses_bash_field_not_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_icm_binary(&dir);
+        let bin_str = json_safe_path(&bin);
+        let json = format!(
+            r#"{{
+              "hooks": {{
+                "sessionStart":         [{{"type":"command","bash":"{bin_str} hook start","timeoutSec":10}}],
+                "preToolUse":           [{{"type":"command","bash":"{bin_str} hook pre","timeoutSec":5}}],
+                "postToolUse":          [{{"type":"command","bash":"{bin_str} hook post","timeoutSec":10}}],
+                "userPromptSubmitted":  [{{"type":"command","bash":"{bin_str} hook prompt","timeoutSec":10}}]
+              }}
+            }}"#
+        );
+        let path = write_settings(&dir, ".copilot/settings.json", &json);
+        let target = make_target(
+            "Copilot CLI",
+            path,
+            &[
+                "sessionStart",
+                "preToolUse",
+                "postToolUse",
+                "userPromptSubmitted",
+            ],
+            HookCommandField::BashTopLevel,
+        );
+        let (checked, broken) = check_json_target(&target);
+        assert_eq!(checked, 4);
+        assert_eq!(broken, 0);
+    }
+
+    /// Stale-binary detection: a hook pointing at a path that doesn't
+    /// exist must be counted as broken so the user is told to run
+    /// `icm init --mode hook --force`.
+    #[test]
+    fn stale_binary_path_is_flagged_broken() {
+        let dir = tempfile::tempdir().unwrap();
+        let json = r#"{
+          "hooks": {
+            "SessionStart": [{"hooks":[{"type":"command","command":"/no/such/path/icm hook start"}]}]
+          }
+        }"#;
+        let path = write_settings(&dir, ".claude/settings.json", json);
+        let target = make_target(
+            "Claude Code",
+            path,
+            &["SessionStart"],
+            HookCommandField::Command,
+        );
+        let (checked, broken) = check_json_target(&target);
+        assert_eq!(checked, 1);
+        assert_eq!(broken, 1);
+    }
+
+    /// Codex CLI lives at `~/.codex/hooks.json`, not `settings.json`.
+    /// Same JSON shape as Claude/Gemini.
+    #[test]
+    fn codex_cli_hooks_json_is_walked() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_icm_binary(&dir);
+        let bin_str = json_safe_path(&bin);
+        let json = format!(
+            r#"{{
+              "hooks": {{
+                "SessionStart":     [{{"hooks":[{{"type":"command","command":"{bin_str} hook start"}}]}}],
+                "PreToolUse":       [{{"matcher":"Bash","hooks":[{{"type":"command","command":"{bin_str} hook pre"}}]}}],
+                "PostToolUse":      [{{"hooks":[{{"type":"command","command":"{bin_str} hook post"}}]}}],
+                "UserPromptSubmit": [{{"hooks":[{{"type":"command","command":"{bin_str} hook prompt"}}]}}]
+              }}
+            }}"#
+        );
+        let path = write_settings(&dir, ".codex/hooks.json", &json);
+        let target = make_target(
+            "Codex CLI",
+            path,
+            &[
+                "SessionStart",
+                "PreToolUse",
+                "PostToolUse",
+                "UserPromptSubmit",
+            ],
+            HookCommandField::Command,
+        );
+        let (checked, broken) = check_json_target(&target);
+        assert_eq!(checked, 4);
+        assert_eq!(broken, 0);
+    }
+
+    /// Missing settings file is silent (skip), not broken.
+    #[test]
+    fn missing_settings_file_is_silently_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = make_target(
+            "Codex CLI",
+            dir.path().join(".codex/hooks.json"),
+            &["SessionStart"],
+            HookCommandField::Command,
+        );
+        let (checked, broken) = check_json_target(&target);
+        assert_eq!(checked, 0);
+        assert_eq!(broken, 0);
+    }
+
+    /// Hooks unrelated to ICM (e.g. rtk-ai/rtk, user scripts) must not
+    /// be counted — `check_icm_hook_command` filters them out.
+    #[test]
+    fn non_icm_hooks_are_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let json = r#"{
+          "hooks": {
+            "PreToolUse": [
+              {"matcher":"Bash","hooks":[{"type":"command","command":"rtk hook claude"}]},
+              {"matcher":"Bash","hooks":[{"type":"command","command":"npx prettier --write"}]}
+            ]
+          }
+        }"#;
+        let path = write_settings(&dir, ".claude/settings.json", json);
+        let target = make_target(
+            "Claude Code",
+            path,
+            &["PreToolUse"],
+            HookCommandField::Command,
+        );
+        let (checked, broken) = check_json_target(&target);
+        assert_eq!(checked, 0, "non-ICM hooks must not contribute to checked");
+        assert_eq!(broken, 0);
+    }
+}
+
+#[cfg(test)]
+mod windows_path_tests {
+    //! Regression tests for issue #180.
+    //!
+    //! Two failure modes on Windows:
+    //!
+    //! 1. `current_exe()` returns `C:\Users\…\icm.exe`. Bash on Windows
+    //!    interprets `\U`, `\A`, `\b` as escape sequences and strips them,
+    //!    so the command at hook fire time is `C:UsersusernameAppData…`
+    //!    — "command not found".
+    //!
+    //! 2. The detect-existing logic uses `cmd.contains("icm hook")`. The
+    //!    Windows command literally reads `icm.exe hook ...`, so the
+    //!    substring never matches. Init re-adds the hook on every run,
+    //!    and `doctor` reports zero hooks even when they're configured.
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn portable_command_path_converts_windows_backslashes_to_forward_slashes() {
+        let p = PathBuf::from(r"C:\Users\jspelletier\AppData\Local\icm\bin\icm.exe");
+        assert_eq!(
+            portable_command_path(&p),
+            "C:/Users/jspelletier/AppData/Local/icm/bin/icm.exe"
+        );
+    }
+
+    #[test]
+    fn portable_command_path_is_a_noop_on_unix_paths() {
+        let p = PathBuf::from("/home/patrick/.local/bin/icm");
+        assert_eq!(portable_command_path(&p), "/home/patrick/.local/bin/icm");
+    }
+
+    #[test]
+    fn cmd_matches_icm_pattern_handles_unix_form() {
+        assert!(cmd_matches_icm_pattern(
+            "/home/p/.local/bin/icm hook pre",
+            "icm hook pre"
+        ));
+        assert!(cmd_matches_icm_pattern(
+            "/home/p/.local/bin/icm hook end",
+            "icm hook"
+        ));
+    }
+
+    /// Issue #180 root cause: `icm.exe hook pre` doesn't contain the
+    /// substring `icm hook pre`. The helper must accept the Windows
+    /// form so init's idempotency and doctor's binary check both work.
+    #[test]
+    fn cmd_matches_icm_pattern_handles_windows_exe_form() {
+        assert!(cmd_matches_icm_pattern(
+            "C:/Users/u/AppData/Local/icm/bin/icm.exe hook pre",
+            "icm hook pre"
+        ));
+        assert!(cmd_matches_icm_pattern(
+            "C:/Users/u/AppData/Local/icm/bin/icm.exe hook end",
+            "icm hook"
+        ));
+    }
+
+    /// Legacy basename-only patterns (`icm-post-tool`, `icm-pretool`)
+    /// also need a Windows variant — those were standalone executables.
+    #[test]
+    fn cmd_matches_icm_pattern_handles_windows_legacy_basename() {
+        assert!(cmd_matches_icm_pattern(
+            "C:/x/icm-post-tool.exe",
+            "icm-post-tool"
+        ));
+    }
+
+    #[test]
+    fn cmd_matches_icm_pattern_rejects_non_icm_commands() {
+        assert!(!cmd_matches_icm_pattern("rtk hook claude", "icm hook"));
+        assert!(!cmd_matches_icm_pattern("npx prettier", "icm hook"));
+        // A pattern about icm must not match a non-icm tool just because
+        // ".exe" appears.
+        assert!(!cmd_matches_icm_pattern("/bin/foo.exe hook", "icm hook"));
+    }
+}
+
+#[cfg(test)]
+mod hook_output_format_tests {
+    //! Issue #120: Cursor's hook runtime requires JSON output. The
+    //! previous behavior — plain markdown via `print!` — triggered
+    //! `JSON Parse Error: Unexpected token …` on every Cursor hook
+    //! fire. These tests pin the wrapping shape and the auto-detect
+    //! logic without mutating process env vars (which are global
+    //! state and would race with sibling tests).
+    use super::*;
+
+    #[test]
+    fn plain_format_passes_through_unchanged() {
+        let ctx = "# Wake-up\n- foo\n- bar\n";
+        assert_eq!(format_hook_context(ctx, HookOutputFormat::Plain), ctx);
+    }
+
+    #[test]
+    fn cursor_format_wraps_as_additional_context_json() {
+        let out = format_hook_context("# Wake-up\n- foo\n", HookOutputFormat::CursorJson);
+        // Must parse as JSON with exactly the expected key.
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            v.get("additional_context")
+                .and_then(|v| v.as_str())
+                .unwrap(),
+            "# Wake-up\n- foo\n",
+        );
+    }
+
+    /// Wake-up packs include backticks, headers, and other markdown
+    /// punctuation. They must round-trip through JSON without breaking
+    /// (escape, then unescape).
+    #[test]
+    fn cursor_format_round_trips_markdown_special_chars() {
+        let ctx = "# H\n\"quoted\"\n```rust\nfn main() {}\n```\nbackslash: \\n\n";
+        let wrapped = format_hook_context(ctx, HookOutputFormat::CursorJson);
+        let v: serde_json::Value = serde_json::from_str(&wrapped).unwrap();
+        assert_eq!(v.get("additional_context").unwrap().as_str().unwrap(), ctx);
+    }
+
+    #[test]
+    fn cursor_format_handles_empty_string() {
+        let out = format_hook_context("", HookOutputFormat::CursorJson);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v.get("additional_context").unwrap().as_str().unwrap(), "");
     }
 }
