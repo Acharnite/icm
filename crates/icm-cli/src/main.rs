@@ -3800,7 +3800,7 @@ fn inject_settings_hook(
     if let Some(m) = matcher {
         entry
             .as_object_mut()
-            .unwrap()
+            .expect("inline json! literal above is always Object")
             .insert("matcher".into(), serde_json::json!(m));
     }
     event_arr.push(entry);
@@ -3880,7 +3880,7 @@ fn inject_codex_hook(
     if let Some(m) = matcher {
         entry
             .as_object_mut()
-            .unwrap()
+            .expect("inline json! literal above is always Object")
             .insert("matcher".into(), serde_json::json!(m));
     }
     event_arr.push(entry);
@@ -4137,7 +4137,12 @@ fn inject_mcp_server(
 
     mcp_servers
         .as_object_mut()
-        .unwrap()
+        .with_context(|| {
+            format!(
+                "`{servers_key}` in {} is not a JSON object",
+                config_path.display()
+            )
+        })?
         .insert(name.to_string(), entry.clone());
 
     let output = serde_json::to_string_pretty(&config)?;
@@ -4176,7 +4181,12 @@ fn inject_zed_mcp_server(config_path: &Path, name: &str, bin_path: &str) -> Resu
 
     servers
         .as_object_mut()
-        .unwrap()
+        .with_context(|| {
+            format!(
+                "`context_servers` in {} is not a JSON object",
+                config_path.display()
+            )
+        })?
         .insert(name.to_string(), zed_entry);
 
     let output = serde_json::to_string_pretty(&config)?;
@@ -4214,15 +4224,23 @@ fn inject_copilot_cli_mcp_server(
         }
     }
 
-    servers.as_object_mut().unwrap().insert(
-        name.to_string(),
-        serde_json::json!({
-            "type": "local",
-            "command": icm_bin,
-            "args": ["serve"],
-            "tools": ["*"]
-        }),
-    );
+    servers
+        .as_object_mut()
+        .with_context(|| {
+            format!(
+                "`mcpServers` in {} is not a JSON object",
+                config_path.display()
+            )
+        })?
+        .insert(
+            name.to_string(),
+            serde_json::json!({
+                "type": "local",
+                "command": icm_bin,
+                "args": ["serve"],
+                "tools": ["*"]
+            }),
+        );
 
     let output = serde_json::to_string_pretty(&config)?;
     std::fs::write(config_path, output)
@@ -4389,7 +4407,12 @@ fn inject_codex_mcp_server(config_path: &Path, name: &str, icm_bin: &str) -> Res
 
     mcp_servers
         .as_table_mut()
-        .unwrap()
+        .with_context(|| {
+            format!(
+                "`mcp_servers` in {} is not a TOML table",
+                config_path.display()
+            )
+        })?
         .insert(name.to_string(), toml::Value::Table(server));
 
     let output = toml::to_string_pretty(&config)?;
@@ -4424,14 +4447,16 @@ fn inject_opencode_mcp_server(config_path: &Path, name: &str, icm_bin: &str) -> 
         }
     }
 
-    mcp.as_object_mut().unwrap().insert(
-        name.to_string(),
-        serde_json::json!({
-            "type": "local",
-            "command": [icm_bin, "serve"],
-            "enabled": true
-        }),
-    );
+    mcp.as_object_mut()
+        .with_context(|| format!("`mcp` in {} is not a JSON object", config_path.display()))?
+        .insert(
+            name.to_string(),
+            serde_json::json!({
+                "type": "local",
+                "command": [icm_bin, "serve"],
+                "enabled": true
+            }),
+        );
 
     let output = serde_json::to_string_pretty(&config)?;
     std::fs::write(config_path, output)
