@@ -65,11 +65,7 @@ pub fn detect_format(path: &Path) -> Result<ImportFormat> {
     // Peek JSON content to discriminate formats
     let content =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    let peek = if content.len() > 4096 {
-        &content[..4096]
-    } else {
-        &content
-    };
+    let peek = crate::truncate_at_char_boundary(&content, 4096);
 
     if peek.contains("chat_messages") || (peek.contains("\"uuid\"") && peek.contains("\"sender\""))
     {
@@ -520,11 +516,7 @@ pub fn cmd_import(
                     thread_id: thread_id.clone(),
                 };
                 mem.keywords = extra_kw;
-                let raw = if text.len() > 500 {
-                    &text[..500]
-                } else {
-                    &text
-                };
+                let raw = crate::truncate_at_char_boundary(&text, 500);
                 mem.raw_excerpt = Some(raw.to_string());
                 store.store(mem)?;
             }
@@ -661,6 +653,64 @@ mod tests {
         let text = exchanges_to_text(&exchanges);
         assert!(text.contains("[user]: Hello"));
         assert!(text.contains("[assistant]: Hi there"));
+    }
+
+    #[test]
+    fn test_raw_excerpt_handles_multibyte_at_boundary() {
+        // Regression for #199: panic when byte 500 falls inside a multibyte UTF-8 char.
+        // Build a string where the 3-byte char `→` straddles offset 500.
+        let mut text = "a".repeat(498);
+        text.push('→'); // bytes 498..501
+        text.push_str(&"b".repeat(100));
+
+        // Pre-condition: byte 500 is inside the multibyte char.
+        assert!(!text.is_char_boundary(500));
+
+        // Must not panic, and must return a valid &str ≤ 500 bytes.
+        let raw = crate::truncate_at_char_boundary(&text, 500);
+        assert!(raw.len() <= 500);
+        assert!(raw.is_char_boundary(raw.len()));
+    }
+
+    #[test]
+    fn test_detect_format_peek_handles_multibyte() {
+        // Same shape as #199 but for the JSON-peek slice at offset 4096.
+        let mut content = "x".repeat(4094);
+        content.push('→'); // bytes 4094..4097
+        content.push_str(&"y".repeat(10));
+        let peek = crate::truncate_at_char_boundary(&content, 4096);
+        assert!(peek.len() <= 4096);
+        assert!(peek.is_char_boundary(peek.len()));
+    }
+
+    #[test]
+    fn test_cmd_import_does_not_panic_on_multibyte_at_boundary() {
+        // End-to-end regression for #199. To trigger the raw_excerpt slice
+        // path the test needs (a) extract_and_classify to return >= 1 fact,
+        // (b) joined text > 500 bytes, (c) byte 500 of the joined text inside
+        // a multibyte char. exchanges_to_text prefixes user content with
+        // "[user]: " (8 bytes), so we place `→` at inner byte 490 so it lands
+        // at joined bytes 498..501 — byte 500 strictly inside the char. The
+        // decision sentence ensures the multilingual scorer extracts a fact.
+        let prefix = "We decided to use Rust for the storage layer because of safety. ";
+        assert!(prefix.len() < 490);
+        let mut text = String::new();
+        text.push_str(prefix);
+        text.push_str(&"a".repeat(490 - prefix.len()));
+        text.push('→'); // inner bytes 490..493 -> joined bytes 498..501
+        text.push_str(&"b".repeat(60));
+
+        let line = format!(
+            r#"{{"type":"user","message":{{"role":"user","content":[{{"type":"text","text":"{text}"}}]}}}}"#
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        std::fs::write(&path, line).unwrap();
+
+        let store = SqliteStore::in_memory().unwrap();
+        // Pre-fix this panicked with "byte index 500 is not a char boundary".
+        cmd_import(&store, path, None, "test".into(), false).unwrap();
     }
 
     #[test]
