@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.10.45](https://github.com/rtk-ai/icm/compare/icm-v0.10.44...icm-v0.10.45) (2026-05-10)
+
+
+### Bug Fixes
+
+* **consolidate, health:** warn that provider=none is a lexical join, not a summary ([#203](https://github.com/rtk-ai/icm/issues/203)) ([f0bbdef](https://github.com/rtk-ai/icm/commit/f0bbdefbc8ac8baaa3044fdbdf4fa975ade946b9))
+* **display:** respect TZ env on every CLI/MCP timestamp render ([#205](https://github.com/rtk-ai/icm/issues/205)) ([6deca6f](https://github.com/rtk-ai/icm/commit/6deca6f85984430219ab594fa054da2e4d3686f8))
+* **doctor:** walk every platform icm init configures, not just Gemini ([#204](https://github.com/rtk-ai/icm/issues/204)) ([ba739e0](https://github.com/rtk-ai/icm/commit/ba739e00bdddfb83588a93f756b3b8da9e1d51aa))
+* **hook:** emit Cursor-shaped JSON when invoked from Cursor ([#209](https://github.com/rtk-ai/icm/issues/209)) ([b57965d](https://github.com/rtk-ai/icm/commit/b57965d0e774c2b66d22d6e3387e891d58e5a566))
+* **import:** truncate at UTF-8 char boundary to avoid panic on multibyte chars ([#201](https://github.com/rtk-ai/icm/issues/201)) ([12b3606](https://github.com/rtk-ai/icm/commit/12b360612196e3faeed4e30e1b4b4c1ca2ecff92))
+* **init, doctor:** forward-slash bin path on Windows + match icm.exe in detect ([#206](https://github.com/rtk-ai/icm/issues/206)) ([c2fd039](https://github.com/rtk-ai/icm/commit/c2fd0393079de59507bfc44dd8771c74bf351460))
+* **tui:** drop crossterm key Release events on Windows to stop double-fire ([#208](https://github.com/rtk-ai/icm/issues/208)) ([2a782c7](https://github.com/rtk-ai/icm/commit/2a782c74c867865302bd8f792ede6e44ff6d19ab))
+
 ## [0.10.44](https://github.com/rtk-ai/icm/compare/icm-v0.10.43...icm-v0.10.44) (2026-05-05)
 
 
