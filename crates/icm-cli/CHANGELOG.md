@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.48](https://github.com/rtk-ai/icm/compare/icm-v0.10.47...icm-v0.10.48) (2026-05-10)
+
+
+### Features
+
+* **extract:** async LLM-CLI extraction path (50ms hooks via pending queue) ([#219](https://github.com/rtk-ai/icm/issues/219)) ([9774aba](https://github.com/rtk-ai/icm/commit/9774aba11d05e34e250bf93714e3c1a6772bceb5))
+
 ## [0.10.47](https://github.com/rtk-ai/icm/compare/icm-v0.10.46...icm-v0.10.47) (2026-05-10)
 
 
