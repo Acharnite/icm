@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.49](https://github.com/rtk-ai/icm/compare/icm-v0.10.48...icm-v0.10.49) (2026-05-11)
+
+
+### Features
+
+* **hooks:** structured telemetry table + `icm hook-log` / `icm hook-stats` ([#222](https://github.com/rtk-ai/icm/issues/222)) ([a923286](https://github.com/rtk-ai/icm/commit/a92328635dc46926abbb52ec6962164ba9fae4ea))
+
 ## [0.10.48](https://github.com/rtk-ai/icm/compare/icm-v0.10.47...icm-v0.10.48) (2026-05-10)
 
 
