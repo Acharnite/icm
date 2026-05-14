@@ -165,8 +165,8 @@ jobs:
       contents: write
       pull-requests: write
     steps:
-      # GITHUB_TOKEN is blocked by the rtk-ai enterprise policy from
-      # creating PRs, so mint a token from the rtk-ai-icm-ci GitHub App.
+      # The default workflow token cannot open PRs in this org; mint a
+      # short-lived token from the configured GitHub App instead.
       - uses: actions/create-github-app-token@v3
         id: app-token
         with:
