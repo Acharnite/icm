@@ -17,4 +17,4 @@ toml = { workspace = true }
 fastembed = { workspace = true, optional = true }
 directories = { workspace = true, optional = true }
 cachedir = { workspace = true, optional = true }
-tracing = { workspace = true, optional = true }
+tracing = { workspace = true }
