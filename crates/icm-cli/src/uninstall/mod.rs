@@ -12,8 +12,11 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::Args;
 
+pub(crate) mod backup;
 pub(crate) mod discover;
+pub(crate) mod formats;
 pub(crate) mod locations;
+pub(crate) mod mutate;
 pub(crate) mod report;
 
 /// CLI surface for `icm uninstall`. Kept here so the rest of the crate only
@@ -93,13 +96,52 @@ pub fn run(opts: UninstallOpts) -> Result<i32> {
         return Ok(exit_codes::CLEAN);
     }
 
-    // --- Mutating run: stubbed until C4 lands ---
+    // --- Mutating run ---
+    if plan.is_empty() {
+        println!("Nothing to uninstall — already clean.");
+        return Ok(exit_codes::CLEAN);
+    }
     report::print_audit(&plan, "ICM uninstall plan");
-    println!();
-    println!(
-        "Mutation phase is not yet implemented (issue #229 follow-up). \
-        Re-run with --dry-run, --audit, or --check, or wait for the \
-        backup + apply commits to land on this branch."
+
+    if !opts.yes && !mutate::confirm("Proceed with removal?") {
+        println!("Aborted (no changes made).");
+        return Ok(exit_codes::USER_DECLINED);
+    }
+
+    let mut backup_session: Option<backup::BackupSession> = if opts.no_backup {
+        None
+    } else {
+        Some(backup::BackupSession::new(
+            opts.backup_dir.as_deref(),
+            &dirs.home,
+        )?)
+    };
+
+    let mut summary = mutate::ApplySummary::default();
+    let outcomes = mutate::apply(&plan, &specs, &mut backup_session);
+    for o in &outcomes {
+        summary.record(o);
+    }
+
+    if opts.purge_data {
+        let purge_outcomes = mutate::purge_data(&plan, &mut backup_session);
+        for o in &purge_outcomes {
+            summary.record(o);
+        }
+    }
+
+    if let Some(b) = &backup_session {
+        b.commit_manifest()?;
+    }
+
+    // Verify pass: rescan to detect any residue (ambiguous YAML, parse
+    // errors that skipped a file, etc.).
+    let after = discover::scan(&specs, opts.purge_data)?;
+    let exit = report::print_apply_summary(
+        &outcomes,
+        &summary,
+        backup_session.as_ref().map(|b| b.root()),
+        after.total_hits(),
     );
-    Ok(exit_codes::CLEAN)
+    Ok(exit)
 }

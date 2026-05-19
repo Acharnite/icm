@@ -104,3 +104,72 @@ pub(crate) fn print_check(plan: &RemovalPlan) -> i32 {
         super::exit_codes::CHECK_RESIDUE
     }
 }
+
+/// Per-outcome and aggregate summary after a mutation run.
+pub(crate) fn print_apply_summary(
+    outcomes: &[super::mutate::ApplyOutcome],
+    summary: &super::mutate::ApplySummary,
+    backup_root: Option<&std::path::Path>,
+    residue_after: usize,
+) -> i32 {
+    println!();
+    println!("Per-file results");
+    println!("----------------");
+    for o in outcomes {
+        let tag = match &o.result {
+            Ok(super::formats::StripResult::NoOp) => "no-op".to_string(),
+            Ok(super::formats::StripResult::Removed { removed }) => {
+                format!("removed {removed}")
+            }
+            Ok(super::formats::StripResult::DeleteFile) => "deleted".to_string(),
+            Ok(super::formats::StripResult::Ambiguous { reason: _ }) => "ambiguous".to_string(),
+            Err(e) => format!("ERROR: {e:#}"),
+        };
+        println!("  [{:<22}] {:<10} {}", o.label, tag, o.path.display());
+    }
+
+    println!();
+    println!("Summary");
+    println!("-------");
+    println!("  Files modified : {}", summary.files_changed);
+    println!("  Files deleted  : {}", summary.files_deleted);
+    println!("  Entries removed: {}", summary.entries_removed);
+
+    if !summary.ambiguous.is_empty() {
+        println!();
+        println!("Ambiguous (manual review needed):");
+        for (p, why) in &summary.ambiguous {
+            println!("  {}: {}", p.display(), why);
+        }
+    }
+    if !summary.errors.is_empty() {
+        println!();
+        println!("Errors:");
+        for (p, why) in &summary.errors {
+            println!("  {}: {}", p.display(), why);
+        }
+    }
+    if let Some(root) = backup_root {
+        println!();
+        println!(
+            "Backups written under {} (restore with `cp -a <ts>/files/. /`)",
+            root.display()
+        );
+    }
+
+    if residue_after > 0 {
+        println!();
+        println!(
+            "WARNING: {residue_after} item(s) remain after the run (see above). \
+            Re-run with --dry-run to inspect."
+        );
+    }
+
+    if !summary.errors.is_empty() {
+        super::exit_codes::MUTATION_ERROR
+    } else if !summary.ambiguous.is_empty() || residue_after > 0 {
+        super::exit_codes::PARTIAL
+    } else {
+        super::exit_codes::CLEAN
+    }
+}
