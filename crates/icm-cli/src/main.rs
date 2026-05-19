@@ -1095,9 +1095,21 @@ fn main() -> Result<()> {
     }
     let cli_db: Option<PathBuf> = cli.db.into_iter().next();
     let db_path = cli_db.clone().unwrap_or_else(default_db_path);
+
+    // `icm uninstall` must NOT open the SQLite store: a default
+    // `open_store` call would recreate the DB directory and WAL/SHM files
+    // immediately after `--purge-data` removed them, leaving the user's
+    // data dir non-empty even though the run reported success. Dispatch
+    // it before `open_store` runs.
+    let command = cli.command;
+    if let Commands::Uninstall(opts) = command {
+        let code = uninstall::run(opts)?;
+        std::process::exit(code);
+    }
+
     let store = open_store(cli_db, embedding_dims)?;
 
-    match cli.command {
+    match command {
         Commands::Store {
             topic,
             content,
@@ -1328,10 +1340,7 @@ fn main() -> Result<()> {
         },
         Commands::Init { mode, force } => cmd_init(mode, force),
         Commands::Doctor => cmd_doctor(),
-        Commands::Uninstall(opts) => {
-            let code = uninstall::run(opts)?;
-            std::process::exit(code);
-        }
+        Commands::Uninstall(_) => unreachable!("dispatched before open_store"),
         Commands::Extract {
             project,
             text,

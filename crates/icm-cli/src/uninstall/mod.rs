@@ -17,7 +17,9 @@ pub(crate) mod discover;
 pub(crate) mod formats;
 pub(crate) mod locations;
 pub(crate) mod mutate;
+pub(crate) mod process;
 pub(crate) mod report;
+pub(crate) mod scan_dir;
 
 /// CLI surface for `icm uninstall`. Kept here so the rest of the crate only
 /// imports `UninstallOpts` from this module.
@@ -81,7 +83,11 @@ pub mod exit_codes {
 pub fn run(opts: UninstallOpts) -> Result<i32> {
     let dirs = locations::DirContext::from_env()?;
     let specs = locations::build_locations(&dirs);
-    let plan = discover::scan(&specs, opts.purge_data)?;
+    let mut plan = discover::scan(&specs, opts.purge_data)?;
+    if let Some(dir) = opts.scan_dir.as_deref() {
+        plan.scan_dir_hits = scan_dir::scan_dir(dir)?;
+    }
+    plan.processes = process::detect_icm_serve();
 
     // --- Read-only modes ---
     if opts.check {
@@ -124,9 +130,33 @@ pub fn run(opts: UninstallOpts) -> Result<i32> {
     }
 
     if opts.purge_data {
-        let purge_outcomes = mutate::purge_data(&plan, &mut backup_session);
-        for o in &purge_outcomes {
-            summary.record(o);
+        // Refuse to purge while `icm serve` is running unless the user
+        // explicitly opted in via `-y`. Serve keeps the SQLite DB open
+        // via WAL; deleting underneath it can corrupt cross-session
+        // neighbour processes.
+        if !plan.processes.is_empty() && !opts.yes {
+            println!();
+            println!(
+                "Refusing to --purge-data: {} `icm serve` process(es) detected. \
+                Stop them with `pkill -f 'icm serve'` (or pass -y to override at your own risk).",
+                plan.processes.len()
+            );
+            for p in &plan.processes {
+                println!("  pid={:<6} {}", p.pid, p.cmdline);
+            }
+        } else {
+            if !plan.processes.is_empty() {
+                println!();
+                println!(
+                    "WARNING: {} `icm serve` process(es) still running — \
+                    purging the DB anyway because -y was passed.",
+                    plan.processes.len()
+                );
+            }
+            let purge_outcomes = mutate::purge_data(&plan, &mut backup_session);
+            for o in &purge_outcomes {
+                summary.record(o);
+            }
         }
     }
 
