@@ -4845,6 +4845,34 @@ fn resolve_consolidate_provider(
     })
 }
 
+/// Check whether `name` resolves to an executable file on `$PATH`.
+///
+/// Used by the extraction drain to decide whether a configured LLM CLI
+/// (claude/codex/gemini/ollama) is actually usable, or whether it should
+/// fall back to the fastembed extractor.
+fn cli_on_path(name: &str) -> bool {
+    let Ok(path) = std::env::var("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|dir| {
+        let candidate = dir.join(name);
+        if !candidate.is_file() {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::metadata(&candidate)
+                .map(|m| m.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false)
+        }
+        #[cfg(not(unix))]
+        {
+            true
+        }
+    })
+}
+
 /// Process the async extraction queue.
 ///
 /// Reads up to `limit` oldest pending rows from `pending_extractions`.
@@ -4854,11 +4882,11 @@ fn resolve_consolidate_provider(
 /// preferences, parses the bullet response, and stores the results as
 /// Memory rows.
 ///
-/// With `provider = "none"` (the default), it falls back to the inline
-/// fastembed extractor — but runs it **once** over the whole drained
-/// batch instead of once per hook fire. That is the deferred half of
-/// the issue #239 fix: editor hooks enqueue cheaply, and the heavy
-/// model load happens here, once per drain.
+/// With `provider = "none"`, or when the resolved CLI is not installed,
+/// it falls back to the fastembed extractor — but runs it **once** over
+/// the whole drained batch instead of once per hook fire. That is the
+/// deferred half of the issue #239 fix: editor hooks enqueue cheaply,
+/// and the heavy model load happens here, once per drain.
 ///
 /// Successfully-processed rows are deleted from the queue regardless of
 /// whether facts were extracted (so an output with no extractable
@@ -4879,9 +4907,24 @@ fn cmd_extract_pending(
         return Ok(());
     }
 
-    let provider_kind = resolve_consolidate_provider(cfg, cli_provider)?;
+    let mut provider_kind = resolve_consolidate_provider(cfg, cli_provider)?;
+    // `auto` always resolves to a concrete CLI provider (Claude is the
+    // ultimate fallback in `detect_provider`). If that CLI is not actually
+    // on PATH, the LLM drain would fail on every run and the queue would
+    // never empty — so downgrade to the batched fastembed path when the
+    // binary is missing.
+    if !matches!(provider_kind, summarizer::ProviderKind::None)
+        && !cli_on_path(provider_kind.as_str())
+    {
+        eprintln!(
+            "[extract-pending] '{}' CLI not found on PATH — draining with \
+             the fastembed extractor instead",
+            provider_kind.as_str()
+        );
+        provider_kind = summarizer::ProviderKind::None;
+    }
     if matches!(provider_kind, summarizer::ProviderKind::None) {
-        // No LLM configured — drain with the fastembed extractor. The
+        // No usable LLM CLI — drain with the fastembed extractor. The
         // model loads once for this whole batch, instead of once per
         // tool call as the pre-#239 hook path did.
         let ids: Vec<String> = pending.iter().map(|(id, ..)| id.clone()).collect();
