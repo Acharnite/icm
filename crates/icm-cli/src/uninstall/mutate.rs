@@ -146,9 +146,15 @@ fn apply_json(
 /// Delete the data directories listed in `plan.hits`. Caller has
 /// confirmed `--purge-data` and (separately) that no `icm serve` process
 /// holds the DB open.
+///
+/// Deliberately skips the backup for these dirs: the user explicitly
+/// requested `--purge-data` (= "lose this data"), so staging copies
+/// would defeat the purpose. It would also recurse pathologically when
+/// the default backup root lives inside the data dir we're about to
+/// delete (`<data_dir>/uninstall-backups/`).
 pub(crate) fn purge_data(
     plan: &RemovalPlan,
-    backup: &mut Option<BackupSession>,
+    _backup: &mut Option<BackupSession>,
 ) -> Vec<ApplyOutcome> {
     let mut outcomes = Vec::new();
     for hit in &plan.hits {
@@ -156,9 +162,6 @@ pub(crate) fn purge_data(
             continue;
         }
         let res: Result<StripResult> = (|| {
-            if let Some(b) = backup.as_mut() {
-                b.stage_dir(&hit.path)?;
-            }
             if hit.path.exists() {
                 std::fs::remove_dir_all(&hit.path)?;
             }

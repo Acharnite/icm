@@ -3,7 +3,7 @@
 //! Layout (Windows-safe ISO timestamp with `-` instead of `:`):
 //!
 //! ```text
-//! ~/.icm-uninstall-backups/2026-05-20T14-32-05/
+//! <icm-data-dir>/uninstall-backups/2026-05-20T14-32-05/
 //!   files/
 //!     home/patrick/.claude/settings.json     (mirrors the original tree)
 //!     home/patrick/.codex/config.toml
@@ -11,9 +11,19 @@
 //!   manifest.json                            (sha256 per staged file)
 //! ```
 //!
-//! Restore is `cp -a <backup>/files/. /` — the relative tree under
-//! `files/` mirrors the original absolute paths with the leading `/`
-//! stripped, so a recursive copy lands every config back where it was.
+//! On Linux `<icm-data-dir>` resolves to `~/.local/share/icm/`, on macOS
+//! to `~/Library/Application Support/icm/`. Override the root with
+//! `--backup-dir <PATH>`. Restore is `cp -a <backup>/files/. /` — the
+//! relative tree under `files/` mirrors the original absolute paths with
+//! the leading `/` stripped, so a recursive copy lands every config back
+//! where it was.
+//!
+//! Note: `uninstall --purge-data` removes the data dir entirely, which
+//! includes this backup root. The orchestrator persists the manifest
+//! *before* the purge runs so the backup is at least complete on disk
+//! for the brief window between mutation and purge — but if you ran
+//! `--purge-data` you explicitly asked to lose this state. Do
+//! `uninstall -y` first if you want the safety net to survive.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -52,12 +62,18 @@ struct Manifest {
 }
 
 impl BackupSession {
-    /// Build a session rooted at `<base>/<ISO-ts>/`. When `override_root`
-    /// is `None`, `<base>` defaults to `~/.icm-uninstall-backups/`.
-    pub(crate) fn new(override_root: Option<&Path>, home: &Path) -> Result<Self> {
+    /// Build a session rooted at `<base>/<ISO-ts>/`.
+    ///
+    /// `override_root` wins when set (the `--backup-dir <PATH>` flag).
+    /// Otherwise the default is `<default_base>` — typically
+    /// `<icm-data-dir>/uninstall-backups/`, with `<icm-data-dir>` itself
+    /// resolved by `directories::ProjectDirs` so the path follows each
+    /// OS's convention (XDG on Linux/WSL, Application Support on macOS,
+    /// AppData/Roaming on Windows).
+    pub(crate) fn new(override_root: Option<&Path>, default_base: &Path) -> Result<Self> {
         let base = match override_root {
             Some(p) => p.to_path_buf(),
-            None => home.join(".icm-uninstall-backups"),
+            None => default_base.to_path_buf(),
         };
         let ts = iso_timestamp_no_colons();
         let root = base.join(&ts);
@@ -123,35 +139,6 @@ impl BackupSession {
                 bytes,
             },
         );
-        Ok(())
-    }
-
-    /// Stage every regular file under `dir` recursively. Used for data
-    /// directories before `--purge-data` deletion.
-    pub(crate) fn stage_dir(&mut self, dir: &Path) -> Result<()> {
-        if !dir.exists() {
-            return Ok(());
-        }
-        let meta = std::fs::symlink_metadata(dir)?;
-        if meta.file_type().is_symlink() {
-            return Ok(());
-        }
-        if meta.is_file() {
-            return self.stage(dir);
-        }
-        for entry in std::fs::read_dir(dir)? {
-            let entry = entry?;
-            let p = entry.path();
-            let m = std::fs::symlink_metadata(&p)?;
-            if m.file_type().is_symlink() {
-                continue;
-            }
-            if m.is_file() {
-                self.stage(&p)?;
-            } else if m.is_dir() {
-                self.stage_dir(&p)?;
-            }
-        }
         Ok(())
     }
 

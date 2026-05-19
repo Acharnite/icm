@@ -51,7 +51,11 @@ pub struct UninstallOpts {
     #[arg(short = 'y', long)]
     pub yes: bool,
 
-    /// Override the backup root. Defaults to `~/.icm-uninstall-backups/<ts>`.
+    /// Override the backup root. Defaults to
+    /// `<icm-data-dir>/uninstall-backups/<ts>/` (resolved by
+    /// `directories::ProjectDirs` so the location follows each OS:
+    /// `~/.local/share/icm/` on Linux/WSL, `~/Library/Application Support/icm/`
+    /// on macOS, `%APPDATA%\icm\icm\data\` on Windows).
     #[arg(long, value_name = "PATH")]
     pub backup_dir: Option<PathBuf>,
 
@@ -86,7 +90,13 @@ pub fn run(opts: UninstallOpts) -> Result<i32> {
     if let Some(dir) = opts.scan_dir.as_deref() {
         plan.scan_dir_hits = scan_dir::scan_dir(dir)?;
     }
-    plan.processes = process::detect_icm_serve();
+    // Process detection only matters when --purge-data is about to
+    // delete the SQLite DB underneath a live `icm serve` (WAL
+    // corruption risk). Skip it otherwise — most users run in
+    // --mode standard which never spawns `icm serve`.
+    if opts.purge_data {
+        plan.processes = process::detect_icm_serve();
+    }
 
     // --- Read-only modes ---
     if opts.check {
@@ -113,12 +123,21 @@ pub fn run(opts: UninstallOpts) -> Result<i32> {
         return Ok(exit_codes::USER_DECLINED);
     }
 
+    // Resolve the default backup root via ProjectDirs so the layout
+    // follows each OS's convention (XDG on Linux/WSL, Application
+    // Support on macOS, AppData/Roaming on Windows). Falls back to a
+    // dotfile at $HOME when ProjectDirs is unavailable (stripped
+    // sandboxes without standard env vars).
+    let default_backup_base = locations::icm_data_dir()
+        .map(|d| d.join("uninstall-backups"))
+        .unwrap_or_else(|| dirs.home.join(".icm-uninstall-backups"));
+
     let mut backup_session: Option<backup::BackupSession> = if opts.no_backup {
         None
     } else {
         Some(backup::BackupSession::new(
             opts.backup_dir.as_deref(),
-            &dirs.home,
+            &default_backup_base,
         )?)
     };
 
@@ -126,6 +145,14 @@ pub fn run(opts: UninstallOpts) -> Result<i32> {
     let outcomes = mutate::apply(&plan, &specs, &mut backup_session);
     for o in &outcomes {
         summary.record(o);
+    }
+
+    // Persist the manifest **before** any --purge-data step: when the
+    // default backup root lives under the data dir we're about to delete,
+    // we want the manifest to have been written at least once before
+    // the recursive remove takes the whole tree.
+    if let Some(b) = &backup_session {
+        b.commit_manifest()?;
     }
 
     if opts.purge_data {
@@ -157,10 +184,6 @@ pub fn run(opts: UninstallOpts) -> Result<i32> {
                 summary.record(o);
             }
         }
-    }
-
-    if let Some(b) = &backup_session {
-        b.commit_manifest()?;
     }
 
     // Verify pass: rescan to detect any residue (ambiguous YAML, parse
