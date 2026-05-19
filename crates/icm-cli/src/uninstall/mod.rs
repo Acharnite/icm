@@ -12,7 +12,9 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::Args;
 
+pub(crate) mod discover;
 pub(crate) mod locations;
+pub(crate) mod report;
 
 /// CLI surface for `icm uninstall`. Kept here so the rest of the crate only
 /// imports `UninstallOpts` from this module.
@@ -74,9 +76,30 @@ pub mod exit_codes {
 /// Entry point. Returns the process exit code; the caller is responsible
 /// for invoking `std::process::exit`.
 pub fn run(opts: UninstallOpts) -> Result<i32> {
-    // Scaffold stage — subsequent commits flesh out discover/mutate/report.
-    println!("icm uninstall (scaffold) — opts: {opts:#?}");
+    let dirs = locations::DirContext::from_env()?;
+    let specs = locations::build_locations(&dirs);
+    let plan = discover::scan(&specs, opts.purge_data)?;
+
+    // --- Read-only modes ---
+    if opts.check {
+        return Ok(report::print_check(&plan));
+    }
+    if opts.audit {
+        report::print_audit(&plan, "ICM uninstall audit");
+        return Ok(exit_codes::CLEAN);
+    }
+    if opts.dry_run {
+        report::print_audit(&plan, "ICM uninstall (dry run)");
+        return Ok(exit_codes::CLEAN);
+    }
+
+    // --- Mutating run: stubbed until C4 lands ---
+    report::print_audit(&plan, "ICM uninstall plan");
     println!();
-    println!("This command is being implemented incrementally. See issue #229.");
+    println!(
+        "Mutation phase is not yet implemented (issue #229 follow-up). \
+        Re-run with --dry-run, --audit, or --check, or wait for the \
+        backup + apply commits to land on this branch."
+    );
     Ok(exit_codes::CLEAN)
 }

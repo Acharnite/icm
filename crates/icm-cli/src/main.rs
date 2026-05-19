@@ -3266,7 +3266,7 @@ fn portable_command_path(path: &Path) -> String {
 /// `C:/.../icm.exe hook pre` was missed by every detect site (init
 /// idempotency, doctor binary check, codex/copilot injectors), so init
 /// re-injected duplicates and doctor reported zero hooks.
-fn cmd_matches_icm_pattern(cmd: &str, pattern: &str) -> bool {
+pub(crate) fn cmd_matches_icm_pattern(cmd: &str, pattern: &str) -> bool {
     if cmd.contains(pattern) {
         return true;
     }
@@ -4293,7 +4293,7 @@ fn strip_jsonc_comments(content: &str) -> String {
 /// Parse a JSON config file with lenient parsing: accepts trailing commas
 /// and JSONC comments (// and /* */). This is the only place we use lenient
 /// parsing — all other JSON handling uses strict serde_json.
-fn parse_json_config(config_path: &std::path::Path) -> Result<Value> {
+pub(crate) fn parse_json_config(config_path: &std::path::Path) -> Result<Value> {
     let content = std::fs::read_to_string(config_path)
         .with_context(|| format!("cannot read {}", config_path.display()))?;
     let clean = strip_jsonc_comments(&content);
