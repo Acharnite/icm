@@ -332,6 +332,14 @@ enum Commands {
         /// Store raw text as low-importance memory when no facts are extracted
         #[arg(long)]
         store_raw: bool,
+
+        /// Queue the raw text for deferred extraction instead of running
+        /// the embedder inline. ~50ms, no model load — drain later with
+        /// `icm extract-pending`. Editor hooks use this so the fastembed
+        /// model is loaded once per drain instead of once per tool call
+        /// (issue #239: CPU/RAM spikes on every read).
+        #[arg(long)]
+        enqueue: bool,
     },
 
     /// Import conversations from external sources (Claude.ai, ChatGPT, Claude Code, Slack, text)
@@ -1227,14 +1235,18 @@ fn main() -> Result<()> {
             provider,
             model,
             dry_run,
-        } => cmd_extract_pending(
-            &store,
-            &cfg.extraction.summarizer,
-            limit,
-            provider.as_deref(),
-            model.as_deref(),
-            dry_run,
-        ),
+        } => {
+            let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
+            cmd_extract_pending(
+                &store,
+                emb_ref,
+                &cfg.extraction.summarizer,
+                limit,
+                provider.as_deref(),
+                model.as_deref(),
+                dry_run,
+            )
+        }
         Commands::Decay { factor } => cmd_decay(&store, factor),
         Commands::Prune { threshold, dry_run } => cmd_prune(&store, threshold, dry_run),
         Commands::Consolidate {
@@ -1323,9 +1335,14 @@ fn main() -> Result<()> {
             text,
             dry_run,
             store_raw,
+            enqueue,
         } => {
-            let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
-            cmd_extract(&store, emb_ref, &project, text, dry_run, store_raw)
+            if enqueue {
+                cmd_extract_enqueue(&store, &project, text)
+            } else {
+                let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
+                cmd_extract(&store, emb_ref, &project, text, dry_run, store_raw)
+            }
         }
         Commands::Import {
             path,
@@ -4830,16 +4847,26 @@ fn resolve_consolidate_provider(
 
 /// Process the async extraction queue.
 ///
-/// Reads up to `limit` oldest pending rows from `pending_extractions`,
-/// concatenates their raw outputs, asks the configured LLM CLI to extract
-/// decisions / architecture / preferences, parses the bullet response,
-/// and stores the results as Memory rows. Successfully-processed rows
-/// are deleted from the queue regardless of whether facts were
-/// extracted (so an output with no extractable content doesn't loop
-/// forever).
+/// Reads up to `limit` oldest pending rows from `pending_extractions`.
+///
+/// With an LLM provider configured, it concatenates their raw outputs,
+/// asks the configured LLM CLI to extract decisions / architecture /
+/// preferences, parses the bullet response, and stores the results as
+/// Memory rows.
+///
+/// With `provider = "none"` (the default), it falls back to the inline
+/// fastembed extractor — but runs it **once** over the whole drained
+/// batch instead of once per hook fire. That is the deferred half of
+/// the issue #239 fix: editor hooks enqueue cheaply, and the heavy
+/// model load happens here, once per drain.
+///
+/// Successfully-processed rows are deleted from the queue regardless of
+/// whether facts were extracted (so an output with no extractable
+/// content doesn't loop forever).
 #[allow(clippy::too_many_arguments)]
 fn cmd_extract_pending(
     store: &SqliteStore,
+    embedder: Option<&dyn icm_core::Embedder>,
     cfg: &config::SummarizerConfig,
     limit: usize,
     cli_provider: Option<&str>,
@@ -4854,11 +4881,43 @@ fn cmd_extract_pending(
 
     let provider_kind = resolve_consolidate_provider(cfg, cli_provider)?;
     if matches!(provider_kind, summarizer::ProviderKind::None) {
-        bail!(
-            "extraction.summarizer.provider = \"none\" — nothing would be \
-             extracted. Set it to auto/claude/codex/gemini/ollama, or \
-             pass --provider on this command."
+        // No LLM configured — drain with the fastembed extractor. The
+        // model loads once for this whole batch, instead of once per
+        // tool call as the pre-#239 hook path did.
+        let ids: Vec<String> = pending.iter().map(|(id, ..)| id.clone()).collect();
+
+        if dry_run {
+            println!("=== Dry run (fastembed) ===");
+            println!("rows: {}", pending.len());
+            return Ok(());
+        }
+
+        let mut stored = 0usize;
+        for (_, project, _, raw, _) in &pending {
+            // Cap auto-extracted importance at Medium: queued tool
+            // output is untrusted (a malicious tool could emit
+            // decision-keyword text to poison wake-up).
+            match extract::extract_and_store_with_embedder(
+                store,
+                raw,
+                project,
+                false,
+                icm_core::Importance::Medium,
+                embedder,
+            ) {
+                Ok(n) => stored += n,
+                Err(e) => eprintln!("[extract-pending] fastembed row failed: {e}"),
+            }
+        }
+
+        let deleted = store.delete_pending_extractions(&ids)?;
+        println!(
+            "Processed {} rows (fastembed), extracted {} facts, dequeued {}.",
+            pending.len(),
+            stored,
+            deleted,
         );
+        return Ok(());
     }
 
     // Build a single LLM prompt covering all rows. The prompt asks for
@@ -5154,6 +5213,49 @@ fn cmd_extract(
         )?;
         println!("Extracted and stored {stored} facts.");
     }
+    Ok(())
+}
+
+/// `icm extract --enqueue`: queue raw text into `pending_extractions`
+/// without touching the embedder.
+///
+/// Editor hooks (the OpenCode plugin, etc.) call this on every Nth tool
+/// call. The previous behavior shelled out to a full `icm extract`,
+/// which reloads the ~multilingual-e5-small ONNX model from scratch in
+/// each short-lived process (~3.7s CPU + a few hundred MB RAM). Reading
+/// many files therefore produced a model reload every few reads — the
+/// CPU/RAM spikes reported in issue #239. Enqueuing instead costs ~50ms
+/// and never loads the model; `icm extract-pending` drains the queue
+/// later, loading the model once for the whole batch.
+fn cmd_extract_enqueue(store: &SqliteStore, project: &str, text: Option<String>) -> Result<()> {
+    let input = match text {
+        Some(t) => t,
+        None => {
+            use std::io::Read;
+            let mut buf = String::new();
+            std::io::stdin()
+                .read_to_string(&mut buf)
+                .context("failed to read stdin")?;
+            buf
+        }
+    };
+
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+
+    // Cap to 8 KB — same bound as the PostToolUse async path. Long tool
+    // outputs are rare and their trailing slice carries the freshest
+    // context.
+    let capped = if trimmed.len() > 8192 {
+        &trimmed[trimmed.len() - 8192..]
+    } else {
+        trimmed
+    };
+
+    let id = store.enqueue_pending_extraction(project, "extract", capped)?;
+    eprintln!("[icm] enqueued raw text for deferred extraction (id={id})");
     Ok(())
 }
 
