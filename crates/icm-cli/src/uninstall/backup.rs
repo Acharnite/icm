@@ -254,9 +254,7 @@ mod tests {
 
         // The staged file's relative path under files/ should mirror the
         // original absolute path (leading slash stripped).
-        let canonical_rel = original
-            .strip_prefix("/")
-            .unwrap_or_else(|_| original.as_path());
+        let canonical_rel = original.strip_prefix("/").unwrap_or(original.as_path());
         let expected = session.files_root.join(canonical_rel);
         assert!(
             expected.exists(),
