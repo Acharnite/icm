@@ -12,6 +12,8 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::Args;
 
+pub(crate) mod locations;
+
 /// CLI surface for `icm uninstall`. Kept here so the rest of the crate only
 /// imports `UninstallOpts` from this module.
 #[derive(Args, Debug, Clone)]

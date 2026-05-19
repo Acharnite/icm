@@ -4346,7 +4346,7 @@ pub(crate) fn home_dir_str() -> Result<String> {
 /// Falls back to `$HOME/{default_subdir}` if the env var is unset or empty.
 /// Mirrors how each tool documents its own override (CLAUDE_CONFIG_DIR,
 /// GEMINI_CONFIG_DIR, CODEX_HOME, COPILOT_HOME).
-fn cli_config_dir(env_var: &str, default_subdir: &str, home: &str) -> PathBuf {
+pub(crate) fn cli_config_dir(env_var: &str, default_subdir: &str, home: &str) -> PathBuf {
     match std::env::var(env_var) {
         Ok(custom) if !custom.is_empty() => PathBuf::from(custom),
         _ => PathBuf::from(home).join(default_subdir),
