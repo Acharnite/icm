@@ -3571,7 +3571,7 @@ You MUST call `icm store` when ANY of the following happens:\n\
 \n\
 Do this BEFORE responding to the user. Not after. Not later. Immediately.\n\
 \n\
-Do NOT store: trivial details, info already in CLAUDE.md, ephemeral state (build logs, git status).\n\
+Do NOT store: trivial details, info already in this file, ephemeral state (build logs, git status).\n\
 \n\
 ### Other commands\n\
 ```bash\n\
